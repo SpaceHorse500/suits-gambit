@@ -1,0 +1,75 @@
+{
+  "meta": {
+    "generation": 33,
+    "timestamp": "20250812_232511",
+    "eval_seed": 75,
+    "fitness": {
+      "median": 12.0,
+      "win_rate": 0.026,
+      "max_score": 324,
+      "min_score": 0,
+      "bust_rate": 0.54,
+      "mean": 13.168,
+      "sd": 22.679677599119437
+    }
+  },
+  "genome": {
+    "forbidden": {
+      "w_stats": -0.07247939514989621,
+      "w_match": 2.5413053838981368,
+      "w_random": -2.333462540766404,
+      "w_anti": -0.9851369731681058,
+      "prefer_info_if_tied": 0.6187523841885065,
+      "gate_last_seat_boost_stats": -0.09688412313490508,
+      "gate_trailing_boost_stats": -0.17733408046934446,
+      "trail_threshold": 2.4184193078963077
+    },
+    "draw_policy": {
+      "min_target_plus": 4,
+      "min_target_times": 3,
+      "min_target_last_seat": -1,
+      "min_target_r5_bump": 0,
+      "plus_scale_base": 0.7851721788103057,
+      "times_scale_base": 0.676438186729255,
+      "w_scale_lead": 0.024002135448626685,
+      "w_scale_trail": -0.10184372946508971,
+      "w_scale_is_last": -0.0064213390052854855,
+      "w_scale_round_weight": -0.012183869109957616,
+      "w_scale_suit_skew": 0.07632831514738157,
+      "jitter": 0.031957829562846055,
+      "push_times_to3_if_p_bust_below": 0.3384041510852679,
+      "push_times_to4_if_p_bust_below": 0.15265320562714138,
+      "push_plus_to4_if_p_bust_below": 0.13517337823532125,
+      "brake_if_large_lead_r5": 4.866329401123712,
+      "brake_scale_r5": 0.1448810073205041,
+      "bank5_bias_plus": 0.3944855421117042,
+      "bank5_bias_times": 0.5315483881995857,
+      "w_scale_overtake": 0.009278828371623069
+    },
+    "ops_policy": {
+      "x_prob_s_le2": 0.4994623419922367,
+      "x_prob_s_3_4": 0.8773694435788775,
+      "x_prob_s_ge5": 0.5147352889448096,
+      "w_xprob_trail": 0.1790494150490114,
+      "w_xprob_lead": -0.04663525101357103,
+      "w_xprob_is_last": -0.020707328808384714,
+      "w_xprob_round": 0.0772508321711457,
+      "x_repeat_s_le3": 0.044400492388449675,
+      "x_repeat_s_4_5": 0.3682014848927831,
+      "x_repeat_s_ge6": 0.36227260625328567,
+      "w_xrep_trail": 0.10459960113300516,
+      "w_xrep_lead": -0.1024846303298254,
+      "w_xrep_round": -0.022861887006752877,
+      "w_xprob_overtake": 0.2423373895156612,
+      "w_xrep_overtake": -0.15593017214573718
+    },
+    "overtake_proxy": {
+      "w_trail": 1.0790753514951976,
+      "w_rounds_left": 0.16635871527528545,
+      "w_is_last": 0.05885240554793711
+    },
+    "fitness_penalty": {
+      "seat_variance_weight": 0.05594163608114469
+    }
+  }
+}

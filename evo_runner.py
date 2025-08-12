@@ -6,10 +6,10 @@ from ga.ga_runner import GARunner
 if __name__ == "__main__":
     cfg = GARunConfig(
         pop_size=50,
-        generations=10,
-        games_per_eval=500,
-        elitism=5,
-        tourney_size=4,
+        generations=200,
+        games_per_eval=2000,
+        elitism=20,
+        tourney_size=8,
         mutation_after_crossover=True,
         mutate_params=MutateParams(sigma_frac=0.12, per_gene_prob=0.35, reset_prob=0.06),
         crossover_params=CrossoverParams(alpha_min=0.3, alpha_max=0.7, per_gene_prob=0.9),

@@ -8,6 +8,11 @@ from evo_player import EvoPlayer
 from game import SuitsGambitGame
 
 class PopulationEvaluator:
+    """
+    Fitness = WIN RATE ONLY.
+    We still run normal games, but the returned Fitness objects are scored purely by
+    win_rate. All other numbers are provided only as diagnostics for logging.
+    """
     def __init__(self, controls: ControlPool):
         self.controls = controls
 
@@ -21,24 +26,28 @@ class PopulationEvaluator:
         ctrl_players = self.controls.make()
         ctrl_names = [c.name for c in ctrl_players]
 
-        # accumulators for genomes
-        totals = [[] for _ in range(P)]
+        # --- Accumulators (minimized; we only *need* wins) ---
         wins = [0 for _ in range(P)]
-        bust_rounds = [0 for _ in range(P)]
-        rounds_played = [0 for _ in range(P)]
+        ctrl_wins: Dict[str, int] = {n: 0 for n in ctrl_names}
+
+        # Kept as diagnostics only (not used for fitness now)
+        totals = [[] for _ in range(P)]
         max_score = [0 for _ in range(P)]
         min_score = [None for _ in range(P)]
+        bust_rounds = [0 for _ in range(P)]
+        rounds_played = [0 for _ in range(P)]
 
-        # accumulators for controls
         ctrl_totals: Dict[str, List[int]] = {n: [] for n in ctrl_names}
-        ctrl_wins: Dict[str, int] = {n: 0 for n in ctrl_names}
-        ctrl_bust_rounds: Dict[str, int] = {n: 0 for n in ctrl_names}
-        ctrl_rounds_played: Dict[str, int] = {n: 0 for n in ctrl_names}
         ctrl_max: Dict[str, int] = {n: 0 for n in ctrl_names}
         ctrl_min: Dict[str, int | None] = {n: None for n in ctrl_names}
+        ctrl_bust_rounds: Dict[str, int] = {n: 0 for n in ctrl_names}
+        ctrl_rounds_played: Dict[str, int] = {n: 0 for n in ctrl_names}
 
+        # --- Simulate ---
         for gidx in range(games_per_eval):
+            # Fresh Evo players each game
             evos = [EvoPlayer(f"Evo{i}", genome=pop[i].to_json()) for i in range(P)]
+            # Mix with controls and shuffle seating deterministically per gidx
             players = evos + self.controls.make()
             random.Random(base_seed + gidx).shuffle(players)
 
@@ -48,56 +57,90 @@ class PopulationEvaluator:
             name_to_idx = {f"Evo{i}": i for i in range(P)}
             for p in players:
                 score = results[p.name]
+
                 if p.name in name_to_idx:
                     i = name_to_idx[p.name]
+                    # diagnostics only
                     totals[i].append(score)
                     max_score[i] = max(max_score[i], score)
-                    min_score[i] = score if min_score[i] is None else min(min_score[i], score)
+                    min_val = min_score[i]
+                    min_score[i] = score if min_val is None else min(min_val, score)
                     rounds_played[i] += len(p.round_scores)
                     bust_rounds[i] += sum(1 for s in p.round_scores if s == 0)
+
                 elif p.name in ctrl_totals:
                     ctrl_totals[p.name].append(score)
                     ctrl_max[p.name] = max(ctrl_max[p.name], score)
-                    ctrl_min[p.name] = score if ctrl_min[p.name] is None else min(ctrl_min[p.name], score)
+                    cmin = ctrl_min[p.name]
+                    ctrl_min[p.name] = score if cmin is None else min(cmin, score)
                     ctrl_rounds_played[p.name] += len(p.round_scores)
                     ctrl_bust_rounds[p.name] += sum(1 for s in p.round_scores if s == 0)
 
+            # WIN RATE ONLY: count wins; ties give no credit
             if winner in name_to_idx:
                 wins[name_to_idx[winner]] += 1
             elif winner in ctrl_wins:
                 ctrl_wins[winner] += 1
 
-        # finalize genomes
+        # --- Finalize genomes (fitness = win_rate only) ---
         fits: List[Fitness] = []
         for i in range(P):
-            ts = totals[i]
-            if not ts:
-                fits.append(Fitness(0.0, 0.0, 0, 0, {"bust_rate": 1.0, "mean": 0.0, "sd": 0.0, "n_games": 0}))
-                continue
-            med = float(stats.median(ts))
-            mx = int(max_score[i])
-            mn = int(min_score[i]) if min_score[i] is not None else 0
             wr = wins[i] / max(1, games_per_eval)
-            br = (bust_rounds[i] / rounds_played[i]) if rounds_played[i] else 1.0
+
+            # Everything else is diagnostics only
+            n = len(totals[i])
+            mean = (sum(totals[i]) / n) if n else 0.0
+            sd = (stats.pstdev(totals[i]) if n > 1 else 0.0)
+            med = float(stats.median(totals[i])) if n else 0.0
+            mx = int(max_score[i]) if n else 0
+            mn = int(min_score[i]) if (min_score[i] is not None) else 0
+            br = (bust_rounds[i] / rounds_played[i]) if rounds_played[i] else 0.0
+
             fits.append(Fitness(
-                median=med, win_rate=wr, max_score=mx, min_score=mn,
-                diagnostics={"bust_rate": br, "mean": sum(ts)/len(ts), "sd": (stats.pstdev(ts) if len(ts)>1 else 0.0), "n_games": len(ts)}
+                # Only win_rate matters; set these neutrally if your GA ignores them,
+                # or leave median for logging but DO NOT sort by it.
+                median=0.0,               # neutral placeholder
+                win_rate=wr,              # <<< FITNESS DIMENSION
+                max_score=0,              # neutral
+                min_score=0,              # neutral
+                diagnostics={
+                    "median_observed": med,
+                    "mean": mean,
+                    "sd": sd,
+                    "max": mx,
+                    "min": mn,
+                    "bust_rate": br,
+                    "n_games": n,
+                }
             ))
 
-        # finalize controls
+        # --- Finalize controls (win_rate only, rest diagnostics) ---
         control_fits: Dict[str, Fitness] = {}
         for n, ts in ctrl_totals.items():
-            if not ts:
-                control_fits[n] = Fitness(0.0, 0.0, 0, 0, {"bust_rate": 1.0, "mean": 0.0, "sd": 0.0, "n_games": 0})
-                continue
-            med = float(stats.median(ts))
-            mx = int(ctrl_max[n])
-            mn = int(ctrl_min[n]) if ctrl_min[n] is not None else 0
             wr = ctrl_wins[n] / max(1, games_per_eval)
+            count = len(ts)
+            mean = (sum(ts) / count) if count else 0.0
+            sd = (stats.pstdev(ts) if count > 1 else 0.0)
+            med = float(stats.median(ts)) if count else 0.0
+            mx = int(ctrl_max[n]) if count else 0
+            mn = int(ctrl_min[n]) if (ctrl_min[n] is not None) else 0
             rounds = ctrl_rounds_played[n]
-            br = (ctrl_bust_rounds[n] / rounds) if rounds else 1.0
+            br = (ctrl_bust_rounds[n] / rounds) if rounds else 0.0
+
             control_fits[n] = Fitness(
-                median=med, win_rate=wr, max_score=mx, min_score=mn,
-                diagnostics={"bust_rate": br, "mean": sum(ts)/len(ts), "sd": (stats.pstdev(ts) if len(ts)>1 else 0.0), "n_games": len(ts)}
+                median=0.0,              # neutral
+                win_rate=wr,             # <<< FITNESS DIMENSION
+                max_score=0,             # neutral
+                min_score=0,             # neutral
+                diagnostics={
+                    "median_observed": med,
+                    "mean": mean,
+                    "sd": sd,
+                    "max": mx,
+                    "min": mn,
+                    "bust_rate": br,
+                    "n_games": count,
+                }
             )
+
         return fits, control_fits
