@@ -1,0 +1,94 @@
+{
+  "name": "Evo_48cf6135ed8c32b7",
+  "uid": "48cf6135ed8c32b7",
+  "generation": 0,
+  "timestamp": 1755058138.3089035,
+  "genome": {
+    "forbidden": {
+      "w_stats": 0.501036518550056,
+      "w_match": 1.0159126834447998,
+      "w_random": 0.0,
+      "w_anti": 0.0,
+      "prefer_info_if_tied": 0.441080667979419,
+      "gate_last_seat_boost_stats": 0.4512774365788145,
+      "gate_trailing_boost_stats": 0.5,
+      "trail_threshold": 4.195689109065463
+    },
+    "draw_policy": {
+      "min_target_plus": 3,
+      "min_target_times": 3,
+      "min_target_last_seat": 0,
+      "min_target_r5_bump": 0,
+      "plus_scale_base": 0.95,
+      "times_scale_base": 1.0414537338243601,
+      "w_scale_lead": 0.04,
+      "w_scale_trail": -0.04,
+      "w_scale_is_last": -0.03,
+      "w_scale_round_weight": 0.01,
+      "w_scale_suit_skew": 0.03,
+      "jitter": 0.02,
+      "push_times_to3_if_p_bust_below": 0.33,
+      "push_times_to4_if_p_bust_below": 0.20076122749289413,
+      "push_plus_to4_if_p_bust_below": 0.14,
+      "brake_if_large_lead_r5": 6.0,
+      "brake_scale_r5": 0.15,
+      "bank5_bias_plus": 0.3580919450751068,
+      "bank5_bias_times": 0.15,
+      "w_scale_overtake": 0.06899036432338733
+    },
+    "ops_policy": {
+      "x_prob_s_le2": 0.27874372530388575,
+      "x_prob_s_3_4": 0.45,
+      "x_prob_s_ge5": 0.3947345919834223,
+      "w_xprob_trail": 0.1,
+      "w_xprob_lead": -0.08595448118817209,
+      "w_xprob_is_last": 0.10402316497822522,
+      "w_xprob_round": -0.02,
+      "x_repeat_s_le3": 0.1,
+      "x_repeat_s_4_5": 0.23169634739586692,
+      "x_repeat_s_ge6": 0.3,
+      "w_xrep_trail": 0.1340810888497654,
+      "w_xrep_lead": -0.06,
+      "w_xrep_round": -0.02,
+      "w_xprob_overtake": 0.08,
+      "w_xrep_overtake": 0.26713968244154235
+    },
+    "overtake_proxy": {
+      "w_trail": 0.5,
+      "w_rounds_left": 0.3,
+      "w_is_last": 0.39985649173958215
+    },
+    "fitness_penalty": {
+      "seat_variance_weight": 0.05
+    }
+  },
+  "fitness": {
+    "win_rate": 0.03333333333333333,
+    "median": 7.0,
+    "q1": 3.0,
+    "q3": 15.0,
+    "max_score": 323,
+    "min_score": 0,
+    "diagnostics": {
+      "mean": 10.942666666666666,
+      "sd": 19.012295483595754,
+      "iqr": 12.0,
+      "bust_rate": 0.4984,
+      "n_games": 1500,
+      "rank_avg": 20.142666666666667,
+      "rank_pct_avg": 0.5173693693693694,
+      "rank_hist": [
+        188,
+        128,
+        130,
+        107,
+        115,
+        167,
+        138,
+        187,
+        157,
+        183
+      ]
+    }
+  }
+}

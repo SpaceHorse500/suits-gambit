@@ -3,7 +3,8 @@
 
 from __future__ import annotations
 import json
-from typing import Tuple
+import time
+from pathlib import Path
 
 # Old-style config types you already have
 from ga.ga_types import GARunConfig, MutateParams, CrossoverParams
@@ -14,7 +15,6 @@ from ga.ga_controls import ControlPool
 from ga.ga_evaluator import PopulationEvaluator
 from ga.ga_mutation import Mutator
 from ga.ga_crossover import CrossoverOperator
-from ga.ga_repository import BotRepository  # <-- NEW
 
 # ANSI colors
 COLORS = {
@@ -31,58 +31,7 @@ COLORS = {
 
 def color_print(text: str, color: str = "GREEN", bold: bool = False) -> None:
     style = COLORS["BOLD"] if bold else ""
-    print(f"{style}{COLORS.get(color,'')}{text}{COLORS['END']}")
-
-# ---------- Helpers to robustly read Fitness stats ----------
-def _pick(obj, diag: dict, default: float, *names: str) -> float:
-    # 1) object attribute
-    for nm in names:
-        if hasattr(obj, nm):
-            v = getattr(obj, nm)
-            if v is not None:
-                try:
-                    return float(v)
-                except Exception:
-                    pass
-    # 2) diagnostics dict
-    for nm in names:
-        if nm in diag:
-            try:
-                return float(diag[nm])
-            except Exception:
-                pass
-    return float(default)
-
-def extract_diag(f) -> Tuple[float, float, float, float, float]:
-    """
-    Returns (median, q1, q3, stdev, bust_rate) from either top-level Fitness fields
-    or f.diagnostics (with several alias names).
-    """
-    d = getattr(f, "diagnostics", None) or {}
-    med  = _pick(f, d, 0.0, "median", "median_observed", "med")
-    q1   = _pick(f, d, 0.0, "q1", "Q1", "p25")
-    q3   = _pick(f, d, 0.0, "q3", "Q3", "p75")
-    sd   = _pick(f, d, 0.0, "sd", "stdev", "std")
-    bust = _pick(f, d, 0.0, "bust_rate", "bust%", "bust")
-    return med, q1, q3, sd, bust
-
-def pick_int(obj, diag: dict, default: int, *names: str) -> int:
-    # For min/max scores when they might be in diagnostics
-    for nm in names:
-        if hasattr(obj, nm):
-            v = getattr(obj, nm)
-            if v is not None:
-                try:
-                    return int(v)
-                except Exception:
-                    pass
-    for nm in names:
-        if nm in diag:
-            try:
-                return int(diag[nm])
-            except Exception:
-                pass
-    return int(default)
+    print(f"{style}{COLORS[color]}{text}{COLORS['END']}")
 
 # ---------- Compat shim so GARunner sees the fields it expects ----------
 class CompatCfg:
@@ -94,6 +43,9 @@ class CompatCfg:
         self.tournament_size = getattr(old, "tourney_size")
         self.seed = getattr(old, "eval_seed", None)
         self.verbose_game = verbose_game
+
+        # Checkpoints (used by GARunner to save best bots)
+        self.checkpoint_dir = "checkpoints"
 
         # If your GARunner ever reads these, they’re here; otherwise harmless.
         mp = getattr(old, "mutate_params", None)
@@ -134,6 +86,7 @@ def build_mutator(mp: MutateParams) -> Mutator:
              reset_probability=getattr(mp, "reset_prob", None)),
     ]
     for kwargs in kw_variants:
+        # remove Nones so we don't pass unknown names unnecessarily
         kwargs = {k: v for k, v in kwargs.items() if v is not None}
         try:
             if kwargs:
@@ -237,56 +190,58 @@ if __name__ == "__main__":
     )
 
     # Build deps (keep only MetaOne if your ControlPool supports it)
-    controls = ControlPool()  # e.g., ControlPool(only=["MetaOne"])
+    controls = ControlPool()  # or ControlPool(only=["MetaOne"])
     evaluator = PopulationEvaluator(controls)
     mutator = build_mutator(base_cfg.mutate_params)
     crosser = build_crosser(base_cfg.crossover_params)
-    repo = BotRepository(root="bots")  # <-- new: where we save per-gen top1
 
     deps = RunnerDeps(
         evaluator=evaluator,
         mutator=mutator,
         crosser=crosser,
         controls=controls,
-        repo=repo,  # <-- pass repo to runner
     )
 
-    # Shim config so GARunner sees expected attribute names
-    class CompatCfg:
-        def __init__(self, old: GARunConfig, verbose_game: int = 0):
-            self.population_size = getattr(old, "pop_size")
-            self.generations = getattr(old, "generations")
-            self.games_per_eval = getattr(old, "games_per_eval")
-            self.elitism = getattr(old, "elitism")
-            self.tournament_size = getattr(old, "tourney_size")
-            self.seed = getattr(old, "eval_seed", None)
-            self.verbose_game = verbose_game
-
+    # Shim config so GARunner sees expected attribute names + checkpoint dir
     cfg = CompatCfg(base_cfg, verbose_game=0)
 
     color_print("=== Starting Evolution ===", "HEADER", bold=True)
     runner = GARunner(cfg, deps)
     best_g, best_f = runner.evolve()
 
+    # Also dump a human-friendly copy at the end (in addition to checkpoints)
+    Path(cfg.checkpoint_dir).mkdir(parents=True, exist_ok=True)
+    uid = getattr(best_g, "uid", getattr(best_g, "id", "best"))
+    final_path = Path(cfg.checkpoint_dir) / f"best_readable_{uid}.json"
+    payload = {
+        "name": f"Evo_{uid}",
+        "uid": uid,
+        "timestamp": time.time(),
+        "genome": best_g.to_json() if hasattr(best_g, "to_json") else getattr(best_g, "data", {}),
+        "fitness": {
+            "win_rate": float(getattr(best_f, "win_rate", 0.0)),
+            "median": float(getattr(best_f, "median", 0.0)),
+            "q1": float(getattr(best_f, "q1", 0.0)),
+            "q3": float(getattr(best_f, "q3", 0.0)),
+            "max_score": int(getattr(best_f, "max_score", 0)),
+            "min_score": int(getattr(best_f, "min_score", 0)),
+            "diagnostics": getattr(best_f, "diagnostics", {}) or {},
+        },
+    }
+    with final_path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+    color_print(f"\nSaved final best to: {final_path}\n", "GREEN", bold=True)
+
+    # Pretty print to console too
     color_print("\n=== Best Genome ===", "HEADER", bold=True)
-    payload = best_g.to_json() if hasattr(best_g, "to_json") else getattr(best_g, "data", {})
-    print(json.dumps(payload, indent=2))
+    print(json.dumps(payload["genome"], indent=2))
 
     color_print("\n=== Best Fitness ===", "HEADER", bold=True)
-    d = getattr(best_f, "diagnostics", None) or {}
-    med, q1, q3, sd, bust = extract_diag(best_f)
-    iqr = q3 - q1
-    max_score = pick_int(best_f, d, 0, "max_score", "max")
-    min_score = pick_int(best_f, d, 0, "min_score", "min")
-
+    bust_rate = float(payload["fitness"]["diagnostics"].get("bust_rate", 0.0))
     print(
-        f"{COLORS['BOLD']}Win Rate:{COLORS['END']} {COLORS['CYAN']}{100*getattr(best_f, 'win_rate', 0.0):.2f}%{COLORS['END']}\n"
-        f"{COLORS['BOLD']}Median:{COLORS['END']} {COLORS['GREEN']}{med:.2f}{COLORS['END']}  "
-        f"{COLORS['BOLD']}Q1:{COLORS['END']} {COLORS['CYAN']}{q1:.2f}{COLORS['END']}  "
-        f"{COLORS['BOLD']}Q3:{COLORS['END']} {COLORS['CYAN']}{q3:.2f}{COLORS['END']}  "
-        f"{COLORS['BOLD']}IQR:{COLORS['END']} {COLORS['CYAN']}{iqr:.2f}{COLORS['END']}  "
-        f"{COLORS['BOLD']}±SD:{COLORS['END']} {COLORS['YELLOW']}{sd:.2f}{COLORS['END']}\n"
-        f"{COLORS['BOLD']}Max Score:{COLORS['END']} {COLORS['YELLOW']}{max_score}{COLORS['END']}  "
-        f"{COLORS['BOLD']}Min Score:{COLORS['END']} {COLORS['RED']}{min_score}{COLORS['END']}  "
-        f"{COLORS['BOLD']}Bust Rate:{COLORS['END']} {COLORS['RED']}{100*bust:.2f}%{COLORS['END']}"
+        f"{COLORS['BOLD']}Median Score:{COLORS['END']} {COLORS['GREEN']}{payload['fitness']['median']:.2f}{COLORS['END']}\n"
+        f"{COLORS['BOLD']}Win Rate:{COLORS['END']} {COLORS['CYAN']}{100*payload['fitness']['win_rate']:.2f}%{COLORS['END']}\n"
+        f"{COLORS['BOLD']}Max Score:{COLORS['END']} {COLORS['YELLOW']}{payload['fitness']['max_score']}{COLORS['END']}\n"
+        f"{COLORS['BOLD']}Min Score:{COLORS['END']} {COLORS['RED']}{payload['fitness']['min_score']}{COLORS['END']}\n"
+        f"{COLORS['BOLD']}Bust Rate:{COLORS['END']} {COLORS['RED']}{100*bust_rate:.2f}%{COLORS['END']}"
     )
