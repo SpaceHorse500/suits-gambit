@@ -1,10 +1,11 @@
+# ga/ga_runner.py
 from __future__ import annotations
 
+import os
 import json
 import random
 import time
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Iterable
 
 from .ga_types import GARunConfig, Fitness
@@ -13,6 +14,10 @@ from .ga_mutation import Mutator
 from .ga_crossover import CrossoverOperator
 from .ga_evaluator import PopulationEvaluator
 from .ga_controls import ControlPool
+
+# -------------------------------
+# ANSI colors
+# -------------------------------
 
 COLORS = {
     "HEADER": "\033[95m",
@@ -30,41 +35,34 @@ def color_text(text: str, color: str = "GREEN", bold: bool = False) -> str:
     style = COLORS["BOLD"] if bold else ""
     return f"{style}{COLORS.get(color,'')}{text}{COLORS['END']}"
 
+# -------------------------------
+# Utilities
+# -------------------------------
+
 def short(uid: str, n: int = 8) -> str:
     return uid[:n]
 
 def _extract_diag(f: Fitness) -> Tuple[float, float, float, float, float]:
-    d = f.diagnostics or {}
+    """
+    Returns (median, q1, q3, sd, bust_rate) from Fitness and diagnostics,
+    with robust fallbacks to older key names.
+    """
+    d = getattr(f, "diagnostics", {}) or {}
     med = float(getattr(f, "median", d.get("median", d.get("median_observed", 0.0))))
     q1  = float(getattr(f, "q1",     d.get("q1",     d.get("Q1", 0.0))))
     q3  = float(getattr(f, "q3",     d.get("q3",     d.get("Q3", 0.0))))
-    sd  = float(d.get("sd",     d.get("stdev", 0.0)))
+    sd  = float(d.get("sd", d.get("stdev", 0.0)))
     bust= float(d.get("bust_rate", d.get("bust%", 0.0)))
     return med, q1, q3, sd, bust
 
-def _rank_info(f: Fitness) -> Tuple[float, float, List[int], int]:
-    d = f.diagnostics or {}
-    ravg = float(d.get("rank_avg", 0.0))
-    rpct = float(d.get("rank_pct_avg", 0.0))
-    rhist = list(d.get("rank_hist", [0]*10))
-    n = int(d.get("n_games", 0))
-    if len(rhist) != 10:
-        rhist = (rhist + [0]*10)[:10]
-    return ravg, rpct, rhist, n
+def _score_key(f: Fitness):
+    # ONLY win rate matters for selection/sorting
+    return (-f.win_rate,)
 
-def _bins_str(hist: List[int]) -> str:
-    total = sum(hist)
-    if total <= 0:
-        return "bins%=[0,0,0,0,0,0,0,0,0,0]"
-    pct = [int(round(100.0*h/total)) for h in hist]
-    return "bins%=[" + ",".join(f"{p}" for p in pct) + "]"
 
-def _score_key(f: Fitness) -> Tuple:
-    med, q1, q3, _, _ = _extract_diag(f)
-    return (-f.win_rate, -med, -q1, -q3)
-
-def _relative_factor(x: float, baseline: float) -> float:
-    return (x / baseline) if baseline > 0 else 0.0
+# -------------------------------
+# GA Runner
+# -------------------------------
 
 @dataclass
 class RunnerDeps:
@@ -74,6 +72,21 @@ class RunnerDeps:
     controls: ControlPool
 
 class GARunner:
+    """
+    Selection → reproduction → evaluation with colorful, detailed reporting.
+
+    API:
+        runner = GARunner(cfg, deps)
+        best_genome, best_fitness = runner.evolve()
+
+    Features:
+      • Uses ONLY win rate as the objective (tie-breakers not used).
+      • Colorful tables (win%, median/Q1/Q3, SD, bust%).
+      • Control bots section with baseline multiplier (× vs avg control win%).
+      • Mixed Top-10 leaderboard (genomes + controls).
+      • Saves a checkpoint JSON whenever a new best appears, and a final best.
+    """
+
     def __init__(self, cfg: GARunConfig, deps: RunnerDeps):
         self.cfg = cfg
         self.evaluator = deps.evaluator
@@ -81,13 +94,19 @@ class GARunner:
         self.crosser = deps.crosser
         self.controls = deps.controls
 
+        # Filled each generation for logging parentage:
         self._last_parent_map: Dict[str, Tuple[str, str]] = {}
 
-        seed = cfg.seed if hasattr(cfg, "seed") else getattr(cfg, "eval_seed", None)
+        seed = getattr(cfg, "seed", None)
+        if seed is None:
+            seed = getattr(cfg, "eval_seed", None)
         self._rng = random.Random(seed) if seed is not None else random
 
-        self.checkpoint_dir = Path(getattr(cfg, "checkpoint_dir", "checkpoints"))
-        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        # ensure checkpoint dir exists
+        self._ckpt_dir = getattr(self.cfg, "checkpoint_dir", "checkpoints")
+        os.makedirs(self._ckpt_dir, exist_ok=True)
+
+    # ------------- Public -------------
 
     def evolve(self, init_pop: Optional[List[Genome]] = None) -> Tuple[Genome, Fitness]:
         t0 = time.time()
@@ -103,28 +122,34 @@ class GARunner:
         best_idx = self._argmin_by(pop_f, key=_score_key)
         best = pop[best_idx]
         best_fit = pop_f[best_idx]
-        self._checkpoint(best, best_fit, gen=0, tag="best_so_far")
+        self._save_best_checkpoint(gen=0, genome=best, fitness=best_fit)
 
-        for gen in range(1, self.cfg.generations + 1):
+        # Generations
+        gens = getattr(self.cfg, "generations", 0)
+        for gen in range(1, gens + 1):
             tg0 = time.time()
 
+            # Selection + reproduction
             tsel0 = time.time()
-            elites_idx = self._select_elites(pop_f, self.cfg.elitism)
+            elites_idx = self._select_elites(pop_f, getattr(self.cfg, "elitism", 0))
             t_selection = time.time() - tsel0
 
             trep0 = time.time()
-            pop = self._reproduce(pop, pop_f, elites_idx)
+            pop = self._reproduce(pop, pop_f, elites_idx)  # updates self._last_parent_map
             t_repro = time.time() - trep0
 
+            # Evaluate new pop
             pop_f, ctrl_f, t_eval = self._evaluate(pop, gen_idx=gen)
 
+            # Track best
             gen_best_idx = self._argmin_by(pop_f, key=_score_key)
             if _score_key(pop_f[gen_best_idx]) < _score_key(best_fit):
                 best = pop[gen_best_idx]
                 best_fit = pop_f[gen_best_idx]
-                self._checkpoint(best, best_fit, gen, tag="best_so_far")
+                self._save_best_checkpoint(gen=gen, genome=best, fitness=best_fit)
 
-            print(color_text(f"=== Generation {gen}/{self.cfg.generations} ===\n", "HEADER", bold=True))
+            # Logging
+            print(color_text(f"=== Generation {gen}/{gens} ===\n", "HEADER", bold=True))
             self._print_population_stats(pop, pop_f, ctrl_f)
             self._print_reproduction_summary(len(elites_idx), len(pop) - len(elites_idx))
             self._print_parentage(self._last_parent_map)
@@ -137,19 +162,21 @@ class GARunner:
                 "BLUE",
             ))
 
-        self._checkpoint(best, best_fit, gen=self.cfg.generations, tag="best_final")
+        # final save
+        self._save_best_checkpoint(gen="final", genome=best, fitness=best_fit, final=True)
         return best, best_fit
 
-    # ---------- core ----------
+    # ------------- Core steps -------------
 
     def _init_population(self, init_pop: Optional[List[Genome]]) -> List[Genome]:
         if init_pop is not None and len(init_pop) > 0:
             return list(init_pop)
+
         P = getattr(self.cfg, "population_size", None) or getattr(self.cfg, "pop_size")
         pop: List[Genome] = []
         base = Genome.default() if hasattr(Genome, "default") else Genome()
         for _ in range(P):
-            g = self.mutator.mutate(base.clone(), rng=self._rng)
+            g = self.mutator.mutate(base.clone(), rng=self._rng)  # use runner RNG to diversify
             pop.append(g)
         return pop
 
@@ -184,14 +211,16 @@ class GARunner:
         new_pop: List[Genome] = []
         parent_map: Dict[str, Tuple[str, str]] = {}
 
+        # Elites
         for i in elite_idx:
             elite_clone = pop[i].clone() if hasattr(pop[i], "clone") else Genome.from_json(pop[i].to_json())
             new_pop.append(elite_clone)
-            parent_map[getattr(elite_clone, "uid", elite_clone.id)] = (
-                getattr(pop[i], "uid", pop[i].id),
-                getattr(pop[i], "uid", pop[i].id),
+            parent_map[getattr(elite_clone, "uid", getattr(elite_clone, "id", ""))] = (
+                getattr(pop[i], "uid", getattr(pop[i], "id", "")),
+                getattr(pop[i], "uid", getattr(pop[i], "id", "")),
             )
 
+        # Children
         needed = P - E
         for _ in range(needed):
             p1_idx = self._tournament(pop, fits, T)
@@ -203,45 +232,55 @@ class GARunner:
                 if hasattr(self.crosser, "crossover") else parent1.clone()
             child = self.mutator.mutate(child, rng=self._rng)
 
-            parent_map[getattr(child, "uid", child.id)] = (
-                getattr(parent1, "uid", parent1.id),
-                getattr(parent2, "uid", parent2.id),
+            parent_map[getattr(child, "uid", getattr(child, "id", ""))] = (
+                getattr(parent1, "uid", getattr(parent1, "id", "")),
+                getattr(parent2, "uid", getattr(parent2, "id", "")),
             )
             new_pop.append(child)
 
         self._last_parent_map = parent_map
         return new_pop
 
-    # ---------- checkpointing ----------
+    # ------------- Saving -------------
 
-    def _checkpoint(self, genome: Genome, fitness: Fitness, gen: int, tag: str = "best") -> None:
-        uid = getattr(genome, "uid", getattr(genome, "id", f"g{gen:03d}"))
-        data = genome.to_json() if hasattr(genome, "to_json") else getattr(genome, "data", {})
+    def _save_best_checkpoint(self, gen, genome: Genome, fitness: Fitness, final: bool=False) -> None:
+        """
+        Save the current best genome + fitness diagnostics to:
+          checkpoints/best_gen_g{gen}.json and checkpoints/best_of_run.json (latest).
+        """
+        try:
+            payload = genome.to_json() if hasattr(genome, "to_json") else getattr(genome, "data", {})
+        except Exception:
+            payload = {}
+
         d = getattr(fitness, "diagnostics", {}) or {}
-
-        payload = {
-            "name": f"Evo_{uid}",
-            "uid": uid,
+        record = {
+            "uid": getattr(genome, "uid", getattr(genome, "id", "")),
             "generation": gen,
-            "timestamp": time.time(),
-            "genome": data,
-            "fitness": {
-                "win_rate": float(getattr(fitness, "win_rate", 0.0)),
-                "median": float(getattr(fitness, "median", d.get("median", 0.0))),
-                "q1": float(getattr(fitness, "q1", d.get("q1", 0.0))),
-                "q3": float(getattr(fitness, "q3", d.get("q3", 0.0))),
-                "max_score": int(getattr(fitness, "max_score", d.get("max_score", 0))),
-                "min_score": int(getattr(fitness, "min_score", d.get("min_score", 0))),
-                "diagnostics": d,
-            },
+            "win_rate": float(getattr(fitness, "win_rate", 0.0)),
+            "median": float(getattr(fitness, "median", d.get("median", 0.0))),
+            "q1": float(getattr(fitness, "q1", d.get("q1", 0.0))),
+            "q3": float(getattr(fitness, "q3", d.get("q3", 0.0))),
+            "diagnostics": d,
+            "genome": payload,
         }
 
-        path = self.checkpoint_dir / f"{tag}_gen{gen:03d}_{uid}.json"
-        with path.open("w", encoding="utf-8") as f:
-            json.dump(payload, f, indent=2)
-        print(color_text(f"[checkpoint] saved {tag} → {path}", "GREEN"))
+        fname = f"best_gen_g{gen}.json" if not final else "best_gen_final.json"
+        path = os.path.join(self._ckpt_dir, fname)
+        latest = os.path.join(self._ckpt_dir, "best_of_run.json")
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(record, f, indent=2)
+            with open(latest, "w", encoding="utf-8") as f:
+                json.dump(record, f, indent=2)
+            print(color_text(
+                f"[Checkpoint] Saved best genome → {path} (and updated best_of_run.json)",
+                "YELLOW"
+            ))
+        except Exception as e:
+            print(color_text(f"[Checkpoint] Failed to save best genome: {e}", "RED"))
 
-    # ---------- logging ----------
+    # ------------- Logging -------------
 
     def _print_population_stats(
         self,
@@ -256,24 +295,22 @@ class GARunner:
         print(color_text("Population Statistics:", "BLUE", bold=True))
         order = list(range(len(pop)))
         order.sort(key=lambda i: _score_key(fits[i]))
+        elites = int(getattr(self.cfg, "elitism", 0))
+
         for rank, i in enumerate(order, 1):
-            tag = color_text("[ELITE]", "GREEN") if rank <= getattr(self.cfg, "elitism", 0) else color_text("[CHILD]", "CYAN")
+            tag = color_text("[ELITE]", "GREEN") if rank <= elites else color_text("[CHILD]", "CYAN")
             f = fits[i]
             med, q1, q3, sd, bust = _extract_diag(f)
-            ravg, rpct, rhist, n_games = _rank_info(f)
 
             win_color  = "GREEN" if f.win_rate >= 0.05 else ("YELLOW" if f.win_rate >= 0.03 else "RED")
             bust_color = "RED" if bust > 0.55 else ("YELLOW" if bust > 0.45 else "GREEN")
-            rk_color   = "GREEN" if rpct <= 0.35 else ("YELLOW" if rpct <= 0.55 else "RED")
 
             print(
-                f" {rank:2d}. {tag} id={color_text(short(getattr(pop[i],'uid', pop[i].id)), 'CYAN')} "
+                f" {rank:2d}. {tag} id={color_text(short(getattr(pop[i],'uid', getattr(pop[i],'id',''))), 'CYAN')} "
                 f"win%={color_text(f'{f.win_rate*100:.2f}%', win_color)} | "
                 f"med={color_text(f'{med:.2f}', 'CYAN')} [Q1={color_text(f'{q1:.2f}','CYAN')} | "
                 f"Q3={color_text(f'{q3:.2f}','CYAN')} | IQR={color_text(f'{(q3-q1):.2f}','CYAN')}] "
-                f"± {sd:.2f} | bust%={color_text(f'{bust*100:.2f}%', bust_color)} | "
-                f"rkμ={color_text(f'{ravg:.2f}', rk_color)} (pctμ={color_text(f'{rpct*100:.1f}%','CYAN')}) | "
-                f"{_bins_str(rhist)}"
+                f"± {sd:.2f} | bust%={color_text(f'{bust*100:.2f}%', bust_color)}"
             )
         print()
 
@@ -281,7 +318,8 @@ class GARunner:
         print(color_text("Reproduction Summary:", "BLUE", bold=True))
         print(f"Elites carried over: {color_text(str(elites), 'GREEN')}")
         print(f"New children created: {color_text(str(children), 'CYAN')}")
-        print(f"Genomes eliminated: {color_text(str(children - elites if children >= elites else 0), 'RED')}")
+        eliminated = max(0, children - elites) if children >= elites else 0
+        print(f"Genomes eliminated: {color_text(str(eliminated), 'RED')}")
         print()
 
     def _print_parentage(self, parent_map: Dict[str, Tuple[str, str]]) -> None:
@@ -297,28 +335,26 @@ class GARunner:
         print()
 
     def _print_controls(self, ctrl: Dict[str, Fitness]) -> None:
+        # Baseline for “×” factor: average of all controls’ win%
         base = (sum(f.win_rate for f in ctrl.values()) / max(1, len(ctrl))) if ctrl else 0.025
         print(color_text("Control Bots Performance:", "BLUE", bold=True))
         for name, f in ctrl.items():
             med, q1, q3, sd, bust = _extract_diag(f)
-            ravg, rpct, rhist, n_games = _rank_info(f)
-            x = _relative_factor(f.win_rate, base)
+            x = (f.win_rate / base) if base > 0 else 0.0
             bust_color = "RED" if bust > 0.55 else ("YELLOW" if bust > 0.45 else "GREEN")
-            rk_color   = "GREEN" if rpct <= 0.35 else ("YELLOW" if rpct <= 0.55 else "RED")
+            mult_color = "GREEN" if x >= 1.0 else "RED"
             print(
                 f"  {color_text(name, 'BLUE')}: "
-                f"win%={color_text(f'{f.win_rate*100:.2f}%', 'GREEN')} ({color_text(f'{x:.2f}×', 'GREEN' if x>=1.0 else 'RED')}) | "
+                f"win%={color_text(f'{f.win_rate*100:.2f}%', 'GREEN')} ({color_text(f'{x:.2f}×', mult_color)}) | "
                 f"med={color_text(f'{med:.2f}','CYAN')} [Q1={color_text(f'{q1:.2f}','CYAN')} | Q3={color_text(f'{q3:.2f}','CYAN')} | "
-                f"IQR={color_text(f'{(q3-q1):.2f}','CYAN')}] | ± {sd:.2f} | bust%={color_text(f'{bust*100:.2f}%', bust_color)} | "
-                f"rkμ={color_text(f'{ravg:.2f}', rk_color)} (pctμ={color_text(f'{rpct*100:.1f}%','CYAN')}) | "
-                f"{_bins_str(rhist)}"
+                f"IQR={color_text(f'{(q3-q1):.2f}','CYAN')}] | ± {sd:.2f} | bust%={color_text(f'{bust*100:.2f}%', bust_color)}"
             )
         print()
 
     def _print_top10_summary(self, pop: List[Genome], fits: List[Fitness], ctrl: Dict[str, Fitness]) -> None:
-        items: List[Tuple[str, str, str, Fitness]] = []
+        items: List[Tuple[str, str, str, Fitness]] = []  # (kind, label, uid, fit)
         for g, f in zip(pop, fits):
-            items.append(("GEN", f"G:{short(getattr(g,'uid', g.id))}", getattr(g,'uid', g.id), f))
+            items.append(("GEN", f"G:{short(getattr(g,'uid', getattr(g,'id','')))}", getattr(g,'uid', getattr(g,'id','')), f))
         for name, f in ctrl.items():
             items.append(("CTRL", name, name, f))
         items.sort(key=lambda x: _score_key(x[3]))
@@ -328,20 +364,19 @@ class GARunner:
         print(color_text("=== SUMMARY: Top 10 (Genomes + Controls) ===", "HEADER", bold=True))
         for rank, (kind, label, _, f) in enumerate(items[:10], 1):
             med, q1, q3, sd, bust = _extract_diag(f)
-            ravg, rpct, rhist, n_games = _rank_info(f)
-            x = _relative_factor(f.win_rate, base)
+            x = (f.win_rate / base) if base > 0 else 0.0
             win_color  = "GREEN" if f.win_rate >= 0.05 else ("YELLOW" if f.win_rate >= 0.03 else "RED")
             bust_color = "RED" if bust > 0.55 else ("YELLOW" if bust > 0.45 else "GREEN")
-            rk_color   = "GREEN" if rpct <= 0.35 else ("YELLOW" if rpct <= 0.55 else "RED")
+            mult_color = "GREEN" if x >= 1.0 else "RED"
             print(
                 f" {rank:2d}. [{kind}] {color_text(label,'CYAN')}: "
-                f"win%={color_text(f'{f.win_rate*100:.2f}%', win_color)} ({color_text(f'{x:.2f}×','GREEN' if x>=1 else 'RED')}) | "
+                f"win%={color_text(f'{f.win_rate*100:.2f}%', win_color)} ({color_text(f'{x:.2f}×', mult_color)}) | "
                 f"med={color_text(f'{med:.2f}','CYAN')} [Q1={color_text(f'{q1:.2f}','CYAN')} | Q3={color_text(f'{q3:.2f}','CYAN')} | "
-                f"IQR={color_text(f'{(q3-q1):.2f}','CYAN')}] | ± {sd:.2f} | bust%={color_text(f'{bust*100:.2f}%', bust_color)} | "
-                f"rkμ={color_text(f'{ravg:.2f}', rk_color)} (pctμ={color_text(f'{rpct*100:.1f}%','CYAN')}) | "
-                f"{_bins_str(rhist)}"
+                f"IQR={color_text(f'{(q3-q1):.2f}','CYAN')}] | ± {sd:.2f} | bust%={color_text(f'{bust*100:.2f}%', bust_color)}"
             )
         print()
+
+    # ------------- helpers -------------
 
     @staticmethod
     def _argmin_by(xs: Iterable, key):

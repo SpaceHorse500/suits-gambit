@@ -160,9 +160,9 @@ if __name__ == "__main__":
     color_print("\n=== Genetic Algorithm Configuration ===", "HEADER", bold=True)
 
     base_cfg = GARunConfig(
-        pop_size=35,
+        pop_size=30,
         generations=200,
-        games_per_eval=1500,
+        games_per_eval=500,
         elitism=10,
         tourney_size=8,
         mutation_after_crossover=True,
