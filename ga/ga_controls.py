@@ -1,75 +1,56 @@
-# ga_controls.py
 from __future__ import annotations
-from typing import List, Any, Optional
+from typing import List, Any, Optional, Dict, Union
 import os, json, copy
-
-# keep these imports if you still use them elsewhere
-from random_player import RandomPlayer   # noqa: F401
-from smart_player import SmartPlayer     # noqa: F401
-from hand_player import HandPlayer       # noqa: F401
-
 from meta_player import MetaPlayer
 from evo_player import EvoPlayer
-
 
 class ControlPool:
     def __init__(
         self,
-        evo_path: str = "good_bots/con1.json",
+        evo_paths: Union[str, List[str]] = ["good_bots/con1.json", "good_bots/con2.json"],  # Now accepts a list
         include_meta: bool = True,
         only: Optional[List[str]] = None,
     ):
         """
-        include_meta: include MetaOne in controls
-        only: optional allowlist of control names to return, e.g. ["EvoCtrl1"] or ["MetaOne","EvoCtrl1"]
-        evo_path: path to JSON file containing either:
-                  - {"genome": {...}}  (saved by repo)
-                  - {...}              (raw genome)
+        Args:
+            evo_paths: Single path (str) or list of paths to JSON genome files.
+            include_meta: Include MetaOne in controls.
+            only: Optional allowlist of control names (e.g., ["MetaOne", "EvoCtrl1", "EvoCtrl2"]).
         """
-        self.evo_path = evo_path
+        self.evo_paths = [evo_paths] if isinstance(evo_paths, str) else evo_paths
         self.include_meta = include_meta
         self.only = set(only) if only else None
-        self._evo_genome = None  # cached after first successful load
+        self._evo_genomes: Dict[str, Dict] = {}  # Cache genomes by filename
 
-    def _load_evo_genome(self):
-        if self._evo_genome is not None:
-            return self._evo_genome
-
-        path = self.evo_path
+    def _load_evo_genome(self, path: str) -> Optional[Dict]:
+        """Load a genome from a JSON file."""
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            if isinstance(data, dict) and isinstance(data.get("genome"), dict):
-                genome = data["genome"]
-            elif isinstance(data, dict):
-                genome = data
-            else:
-                print(f"[ga_controls] WARN: {path} did not contain a dict genome.")
-                genome = None
-        except FileNotFoundError:
-            print(f"[ga_controls] WARN: evo control file not found: {path}")
-            genome = None
+            return data.get("genome") if isinstance(data, dict) else data
         except Exception as e:
-            print(f"[ga_controls] WARN: failed to load evo control from {path}: {e}")
-            genome = None
-
-        self._evo_genome = genome
-        return genome
+            print(f"[ga_controls] WARN: Failed to load {path}: {e}")
+            return None
 
     def make(self) -> List[Any]:
-        """
-        Return the list of control players for a table.
-        Called frequently by evaluators, so we instantiate new player objects
-        but reuse the cached genome payload.
-        """
+        """Return the list of control players."""
         bots: List[Any] = []
 
+        # Add MetaOne if allowed
         if self.include_meta and (self.only is None or "MetaOne" in self.only):
             bots.append(MetaPlayer("MetaOne"))
 
-        genome = self._load_evo_genome()
-        if genome is not None and (self.only is None or "EvoCtrl1" in self.only):
-            # pass a deep copy to avoid any accidental in-game mutation
-            bots.append(EvoPlayer("EvoCtrl1", genome=copy.deepcopy(genome)))
+        # Add EvoPlayers for each genome file
+        for i, path in enumerate(self.evo_paths, start=1):
+            bot_name = f"EvoCtrl{i}"
+            if self.only is not None and bot_name not in self.only:
+                continue  # Skip if not in allowlist
+
+            if path not in self._evo_genomes:  # Cache genomes to avoid reloading
+                self._evo_genomes[path] = self._load_evo_genome(path)
+
+            genome = self._evo_genomes.get(path)
+            if genome:
+                bots.append(EvoPlayer(bot_name, genome=copy.deepcopy(genome)))
 
         return bots
