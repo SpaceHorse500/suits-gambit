@@ -4,7 +4,15 @@ from typing import Any, Dict, List, Optional
 from evo_io import DEFAULT_GENOME
 from .ga_bounds import iter_paths, get_holder, clamp_to_bounds
 
+
 class Genome:
+    """
+    Genome wrapper around the DEFAULT_GENOME structure with a stable hash id.
+
+    Runner-compat additions:
+      • .uid  -> alias of .id
+      • .default() -> alias of .from_default()
+    """
     def __init__(self, data: Dict[str, Any] | None = None):
         self.data: Dict[str, Any] = copy.deepcopy(data if data is not None else DEFAULT_GENOME)
         self.parent_ids: Optional[List[str]] = None  # set by GA runner if desired
@@ -15,9 +23,19 @@ class Genome:
         s = json.dumps(self.data, sort_keys=True, separators=(",", ":"))
         return hashlib.blake2s(s.encode("utf-8"), digest_size=8).hexdigest()
 
+    # Runner-friendly alias
+    @property
+    def uid(self) -> str:
+        return self.id
+
     @classmethod
     def from_default(cls) -> "Genome":
         return cls(copy.deepcopy(DEFAULT_GENOME))
+
+    # Runner-friendly alias
+    @classmethod
+    def default(cls) -> "Genome":
+        return cls.from_default()
 
     def clone(self) -> "Genome":
         return Genome(copy.deepcopy(self.data))
