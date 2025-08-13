@@ -40,17 +40,34 @@ def short(uid: str, n: int = 8) -> str:
     return uid[:n]
 
 def _extract_diag(f: Fitness) -> Tuple[float, float, float, float, float]:
-    """
-    Returns (median, q1, q3, sd, bust_rate) from Fitness.diagnostics,
-    with robust fallbacks to older key names.
-    """
-    d = f.diagnostics or {}
-    med = float(d.get("median", d.get("median_observed", 0.0)))
-    q1  = float(d.get("q1",     d.get("Q1", 0.0)))
-    q3  = float(d.get("q3",     d.get("Q3", 0.0)))
-    sd  = float(d.get("sd",     d.get("stdev", 0.0)))
-    bust= float(d.get("bust_rate", d.get("bust%", 0.0)))
+    """Returns (median, q1, q3, stdev, bust_rate) from either top-level Fitness fields
+    or f.diagnostics (with several alias names)."""
+    d = getattr(f, "diagnostics", None) or {}
+    med  = _pick(f, d, 0.0, "median", "median_observed", "med")
+    q1   = _pick(f, d, 0.0, "q1", "Q1", "p25")
+    q3   = _pick(f, d, 0.0, "q3", "Q3", "p75")
+    sd   = _pick(f, d, 0.0, "sd", "stdev", "std")
+    bust = _pick(f, d, 0.0, "bust_rate", "bust%", "bust")
     return med, q1, q3, sd, bust
+
+def _pick(obj, diag: dict, default: float, *names: str) -> float:
+    # 1) object attribute
+    for nm in names:
+        if hasattr(obj, nm):
+            v = getattr(obj, nm)
+            if v is not None:
+                try:
+                    return float(v)
+                except Exception:
+                    pass
+    # 2) diagnostics dict
+    for nm in names:
+        if nm in diag:
+            try:
+                return float(diag[nm])
+            except Exception:
+                pass
+    return float(default)
 
 def _score_key(f: Fitness) -> Tuple:
     """

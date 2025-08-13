@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 import json
+from typing import Tuple
 
 # Old-style config types you already have
 from ga.ga_types import GARunConfig, MutateParams, CrossoverParams
@@ -29,7 +30,58 @@ COLORS = {
 
 def color_print(text: str, color: str = "GREEN", bold: bool = False) -> None:
     style = COLORS["BOLD"] if bold else ""
-    print(f"{style}{COLORS[color]}{text}{COLORS['END']}")
+    print(f"{style}{COLORS.get(color,'')}{text}{COLORS['END']}")
+
+# ---------- Helpers to robustly read Fitness stats ----------
+def _pick(obj, diag: dict, default: float, *names: str) -> float:
+    # 1) object attribute
+    for nm in names:
+        if hasattr(obj, nm):
+            v = getattr(obj, nm)
+            if v is not None:
+                try:
+                    return float(v)
+                except Exception:
+                    pass
+    # 2) diagnostics dict
+    for nm in names:
+        if nm in diag:
+            try:
+                return float(diag[nm])
+            except Exception:
+                pass
+    return float(default)
+
+def extract_diag(f) -> Tuple[float, float, float, float, float]:
+    """
+    Returns (median, q1, q3, stdev, bust_rate) from either top-level Fitness fields
+    or f.diagnostics (with several alias names).
+    """
+    d = getattr(f, "diagnostics", None) or {}
+    med  = _pick(f, d, 0.0, "median", "median_observed", "med")
+    q1   = _pick(f, d, 0.0, "q1", "Q1", "p25")
+    q3   = _pick(f, d, 0.0, "q3", "Q3", "p75")
+    sd   = _pick(f, d, 0.0, "sd", "stdev", "std")
+    bust = _pick(f, d, 0.0, "bust_rate", "bust%", "bust")
+    return med, q1, q3, sd, bust
+
+def pick_int(obj, diag: dict, default: int, *names: str) -> int:
+    # For min/max scores when they might be in diagnostics
+    for nm in names:
+        if hasattr(obj, nm):
+            v = getattr(obj, nm)
+            if v is not None:
+                try:
+                    return int(v)
+                except Exception:
+                    pass
+    for nm in names:
+        if nm in diag:
+            try:
+                return int(diag[nm])
+            except Exception:
+                pass
+    return int(default)
 
 # ---------- Compat shim so GARunner sees the fields it expects ----------
 class CompatCfg:
@@ -81,7 +133,6 @@ def build_mutator(mp: MutateParams) -> Mutator:
              reset_probability=getattr(mp, "reset_prob", None)),
     ]
     for kwargs in kw_variants:
-        # remove Nones so we don't pass unknown names unnecessarily
         kwargs = {k: v for k, v in kwargs.items() if v is not None}
         try:
             if kwargs:
@@ -185,7 +236,7 @@ if __name__ == "__main__":
     )
 
     # Build deps (keep only MetaOne if your ControlPool supports it)
-    controls = ControlPool()  # or ControlPool(only=["MetaOne"])
+    controls = ControlPool()  # e.g., ControlPool(only=["MetaOne"])
     evaluator = PopulationEvaluator(controls)
     mutator = build_mutator(base_cfg.mutate_params)
     crosser = build_crosser(base_cfg.crossover_params)
@@ -209,13 +260,20 @@ if __name__ == "__main__":
     print(json.dumps(payload, indent=2))
 
     color_print("\n=== Best Fitness ===", "HEADER", bold=True)
-    bust_rate = 0.0
-    if hasattr(best_f, "diagnostics") and isinstance(best_f.diagnostics, dict):
-        bust_rate = float(best_f.diagnostics.get("bust_rate", 0.0))
+    d = getattr(best_f, "diagnostics", None) or {}
+    med, q1, q3, sd, bust = extract_diag(best_f)
+    iqr = q3 - q1
+    max_score = pick_int(best_f, d, 0, "max_score", "max")
+    min_score = pick_int(best_f, d, 0, "min_score", "min")
+
     print(
-        f"{COLORS['BOLD']}Median Score:{COLORS['END']} {COLORS['GREEN']}{getattr(best_f, 'median', 0.0):.2f}{COLORS['END']}\n"
         f"{COLORS['BOLD']}Win Rate:{COLORS['END']} {COLORS['CYAN']}{100*getattr(best_f, 'win_rate', 0.0):.2f}%{COLORS['END']}\n"
-        f"{COLORS['BOLD']}Max Score:{COLORS['END']} {COLORS['YELLOW']}{getattr(best_f, 'max_score', 0)}{COLORS['END']}\n"
-        f"{COLORS['BOLD']}Min Score:{COLORS['END']} {COLORS['RED']}{getattr(best_f, 'min_score', 0)}{COLORS['END']}\n"
-        f"{COLORS['BOLD']}Bust Rate:{COLORS['END']} {COLORS['RED']}{100*bust_rate:.2f}%{COLORS['END']}"
+        f"{COLORS['BOLD']}Median:{COLORS['END']} {COLORS['GREEN']}{med:.2f}{COLORS['END']}  "
+        f"{COLORS['BOLD']}Q1:{COLORS['END']} {COLORS['CYAN']}{q1:.2f}{COLORS['END']}  "
+        f"{COLORS['BOLD']}Q3:{COLORS['END']} {COLORS['CYAN']}{q3:.2f}{COLORS['END']}  "
+        f"{COLORS['BOLD']}IQR:{COLORS['END']} {COLORS['CYAN']}{iqr:.2f}{COLORS['END']}  "
+        f"{COLORS['BOLD']}±SD:{COLORS['END']} {COLORS['YELLOW']}{sd:.2f}{COLORS['END']}\n"
+        f"{COLORS['BOLD']}Max Score:{COLORS['END']} {COLORS['YELLOW']}{max_score}{COLORS['END']}  "
+        f"{COLORS['BOLD']}Min Score:{COLORS['END']} {COLORS['RED']}{min_score}{COLORS['END']}  "
+        f"{COLORS['BOLD']}Bust Rate:{COLORS['END']} {COLORS['RED']}{100*bust:.2f}%{COLORS['END']}"
     )
