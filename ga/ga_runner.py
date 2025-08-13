@@ -1,3 +1,4 @@
+# ga/ga_runner.py
 from __future__ import annotations
 
 import random
@@ -11,6 +12,7 @@ from .ga_mutation import Mutator
 from .ga_crossover import CrossoverOperator
 from .ga_evaluator import PopulationEvaluator
 from .ga_controls import ControlPool
+from .ga_repository import BotRepository  # <-- NEW
 
 # -------------------------------
 # ANSI colors
@@ -89,20 +91,12 @@ class RunnerDeps:
     mutator: Mutator
     crosser: CrossoverOperator
     controls: ControlPool
+    repo: Optional[BotRepository] = None  # <-- NEW
 
 class GARunner:
     """
     Selection → reproduction → evaluation with colorful, detailed reporting.
-
-    API is unchanged vs your current code:
-        runner = GARunner(cfg, deps)
-        best_genome, best_fitness = runner.evolve()
-
-    Improvements:
-      • Colored population table (win%, Q1/Median/Q3, IQR, SD, bust%).
-      • Reproduction summary w/ parentage preview.
-      • Control bots section with baseline multiplier (× vs avg control win%).
-      • Mixed Top-10 leaderboard (genomes + controls).
+    Also saves the Top-1 (non-control) genome each generation via BotRepository.
     """
 
     def __init__(self, cfg: GARunConfig, deps: RunnerDeps):
@@ -111,6 +105,7 @@ class GARunner:
         self.mutator = deps.mutator
         self.crosser = deps.crosser
         self.controls = deps.controls
+        self.repo: Optional[BotRepository] = deps.repo or BotRepository()  # <-- NEW
 
         # Filled each generation for logging parentage:
         self._last_parent_map: Dict[str, Tuple[str, str]] = {}
@@ -131,9 +126,13 @@ class GARunner:
         self._print_top10_summary(pop, pop_f, ctrl_f)
         print(color_text(f"[Timing] init evaluation={t_eval:.2f}s | total={time.time()-t0:.2f}s\n", "BLUE"))
 
+        # Best of generation 0 (non-controls)
         best_idx = self._argmin_by(pop_f, key=_score_key)  # argmin because key returns negatives
         best = pop[best_idx]
         best_fit = pop_f[best_idx]
+
+        # SAVE Top-1 of gen 0
+        self._save_top1(gen_idx=0, genome=best, fitness=best_fit)
 
         # Generations
         for gen in range(1, self.cfg.generations + 1):
@@ -151,11 +150,16 @@ class GARunner:
             # Evaluate new pop
             pop_f, ctrl_f, t_eval = self._evaluate(pop, gen_idx=gen)
 
-            # Track best
+            # Top-of-generation (non-controls)
             gen_best_idx = self._argmin_by(pop_f, key=_score_key)
+
+            # Update global best
             if _score_key(pop_f[gen_best_idx]) < _score_key(best_fit):
                 best = pop[gen_best_idx]
                 best_fit = pop_f[gen_best_idx]
+
+            # SAVE Top-1 of this generation
+            self._save_top1(gen_idx=gen, genome=pop[gen_best_idx], fitness=pop_f[gen_best_idx])
 
             # Logging
             print(color_text(f"=== Generation {gen}/{self.cfg.generations} ===\n", "HEADER", bold=True))
@@ -247,6 +251,25 @@ class GARunner:
 
         self._last_parent_map = parent_map
         return new_pop
+
+    # ------------- Saving -------------
+
+    def _save_top1(self, gen_idx: int, genome: Genome, fitness: Fitness) -> None:
+        if not self.repo:
+            return
+        try:
+            bot_id = getattr(genome, "uid", getattr(genome, "id", None))
+            eval_seed = getattr(self.cfg, "seed", None) or getattr(self.cfg, "eval_seed", 0)
+            payload = genome.to_json() if hasattr(genome, "to_json") else getattr(genome, "data", {})
+            self.repo.save_best(
+                genome_dict=payload,
+                fitness=fitness,
+                gen_idx=gen_idx,
+                eval_seed=eval_seed,
+                bot_id=bot_id,
+            )
+        except Exception as e:
+            print(color_text(f"[WARN] Failed to save Top-1 for gen {gen_idx}: {e}", "YELLOW"))
 
     # ------------- Logging -------------
 

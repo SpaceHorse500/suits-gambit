@@ -14,6 +14,7 @@ from ga.ga_controls import ControlPool
 from ga.ga_evaluator import PopulationEvaluator
 from ga.ga_mutation import Mutator
 from ga.ga_crossover import CrossoverOperator
+from ga.ga_repository import BotRepository  # <-- NEW
 
 # ANSI colors
 COLORS = {
@@ -240,15 +241,27 @@ if __name__ == "__main__":
     evaluator = PopulationEvaluator(controls)
     mutator = build_mutator(base_cfg.mutate_params)
     crosser = build_crosser(base_cfg.crossover_params)
+    repo = BotRepository(root="bots")  # <-- new: where we save per-gen top1
 
     deps = RunnerDeps(
         evaluator=evaluator,
         mutator=mutator,
         crosser=crosser,
         controls=controls,
+        repo=repo,  # <-- pass repo to runner
     )
 
     # Shim config so GARunner sees expected attribute names
+    class CompatCfg:
+        def __init__(self, old: GARunConfig, verbose_game: int = 0):
+            self.population_size = getattr(old, "pop_size")
+            self.generations = getattr(old, "generations")
+            self.games_per_eval = getattr(old, "games_per_eval")
+            self.elitism = getattr(old, "elitism")
+            self.tournament_size = getattr(old, "tourney_size")
+            self.seed = getattr(old, "eval_seed", None)
+            self.verbose_game = verbose_game
+
     cfg = CompatCfg(base_cfg, verbose_game=0)
 
     color_print("=== Starting Evolution ===", "HEADER", bold=True)
