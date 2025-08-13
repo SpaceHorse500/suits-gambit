@@ -1,4 +1,4 @@
-# game.py
+# suits_gambit_game.py
 from typing import List, Dict, Any, Optional, Tuple
 from cards import Deck
 from players import BasePlayer
@@ -6,31 +6,12 @@ from utils import evaluate_expression, expr_string_annotated
 
 ROUNDS = 5
 
-# Optional import of extra stats
-try:
-    from stats_extra import StatsCollector, RoundOutcome
-except ImportError:
-    StatsCollector = None
-    RoundOutcome = None
-
-
 class SuitsGambitGame:
-    """
-    Turn-based Suits Gambit supporting N players.
-    
-    Verbosity levels:
-      - 0: no printing
-      - 1: only the final concise scoreboard (with [k].0 bust annotations)
-      - 2: full detailed logs (per-draw, picks, etc.)
-    """
     def __init__(self, players: List[BasePlayer], verbose: int | bool = 0,
                  seed: Optional[int] = None, stats: Optional["StatsCollector"] = None):
         assert len(players) >= 2, "Need at least two players."
         self.players = players
-        if isinstance(verbose, bool):
-            self.verbose = 2 if verbose else 0
-        else:
-            self.verbose = int(verbose)
+        self.verbose = 2 if isinstance(verbose, bool) and verbose else int(verbose)
         if seed is not None:
             import random
             random.seed(seed)
@@ -38,18 +19,11 @@ class SuitsGambitGame:
         self._log = self._setup_logger()
 
     def _setup_logger(self):
-        """Pre-configure the log function to avoid repeated checks."""
         if self.verbose >= 2:
-            def log_func(msg: str):
-                print(msg)
-            return log_func
-        else:
-            def log_func(msg: str):
-                pass
-            return log_func
+            return lambda msg: print(msg)
+        return lambda msg: None
 
     def _public_state(self) -> Dict[str, Any]:
-        """Generates the public state, now cached and reused."""
         return {
             "players_public": [
                 {"name": p.name, "scores": list(p.round_scores), "ops": list(p.ops_between)}
@@ -60,33 +34,15 @@ class SuitsGambitGame:
         }
 
     def _play_single_turn(self, player: BasePlayer, round_idx: int, public_state: Dict[str, Any]) -> Tuple[int, Optional[int]]:
-        """
-        One player's turn with a fresh deck.
-        Returns (score, pre_bust_streak) where pre_bust_streak is None if no bust occurred.
-        """
         deck = Deck()
         deck.reset()
-
-        first = deck.draw()
-        assert first is not None
-        self._log(f"  [{player.name}] info card: {first.rank}{first.suit} (rem {deck.remaining()})")
-
-        # Declare forbidden suit
-        forbidden_ctx: Dict[str, Any] = {
-            "phase": "declare_forbidden",
-            "round_index": round_idx,
-            "public": public_state,
-            "info_card": {"rank": first.rank, "suit": first.suit},
-            "deck_remaining_by_suit": deck.remaining_by_suit(),
-        }
-        forbidden = player.choose_forbidden_suit(first, forbidden_ctx)
-        self._log(f"  [{player.name}] forbidden suit: {forbidden}")
-
-        points = 1
-        made_first_guess = False
+        points = 0
         pre_bust: Optional[int] = None
+        last_card = None
+        last_forbidden_suit: Optional[str] = None  # FIX: explicit init
 
         while True:
+            # Draw new card and declare new forbidden suit
             card = deck.draw()
             if not card:
                 self._log(f"  [{player.name}] deck exhausted -> auto-stop with {points}")
@@ -94,45 +50,52 @@ class SuitsGambitGame:
 
             self._log(f"    draw: {card.rank}{card.suit} (rem {deck.remaining()})")
 
-            if card.suit == forbidden:
+            forbidden_ctx = {
+                "phase": "declare_forbidden",
+                "round_index": round_idx,
+                "public": public_state,
+                "info_card": {"rank": card.rank, "suit": card.suit},
+                "deck_remaining_by_suit": deck.remaining_by_suit(),
+                "last_card": last_card,
+                "current_points": points,
+            }
+            forbidden_suit = player.choose_forbidden_suit(card, forbidden_ctx)
+            self._log(f"    [{player.name}] new forbidden suit: {forbidden_suit}")
+
+            # Bust check uses the PREVIOUS forbidden suit (applies to this draw)
+            if last_card and last_forbidden_suit is not None and card.suit == last_forbidden_suit:
                 pre_bust = points
                 self._log(f"    -> BUST! [{player.name}] scores 0 this round.")
                 points = 0
                 break
 
             points += 1
-            made_first_guess = True
+            last_card = card
+            last_forbidden_suit = forbidden_suit
 
-            # Decision to continue/stop
-            decision_ctx = {
-                "phase": "draw_decision",
-                "round_index": round_idx,
-                "public": public_state,
-                "current_points": points,
-                "last_card": {"rank": card.rank, "suit": card.suit},
-                "deck_remaining_by_suit": deck.remaining_by_suit(),
-            }
-            action = player.choose_continue_or_stop(points, decision_ctx)
-
-            if not made_first_guess and action == "stop":
-                self._log(f"    [RULE] {player.name} cannot stop before first guess -> forcing continue")
-                action = "continue"
-
-            if action not in ("continue", "stop"):
-                action = "continue"
-
-            self._log(f"    [{player.name}] points={points}; action={action}")
-            if action == "stop":
-                break
+            # Decision to continue/stop (after at least 1 point)
+            if points >= 1:
+                decision_ctx = {
+                    "phase": "draw_decision",
+                    "round_index": round_idx,
+                    "public": public_state,
+                    "current_points": points,
+                    "last_card": {"rank": card.rank, "suit": card.suit},
+                    "deck_remaining_by_suit": deck.remaining_by_suit(),
+                    "current_forbidden": forbidden_suit,  # FIX: explicit for p_bust
+                }
+                action = player.choose_continue_or_stop(points, decision_ctx)
+                if action == "stop":
+                    break
 
         self._log(f"  [{player.name}] ends Round {round_idx} with: {points}\n")
         return points, pre_bust
 
     def _operator_pick_phase(self, round_idx: int, public_state: Dict[str, Any]):
         self._log(f"Operator picks between R{round_idx} & R{round_idx+1}:")
-        previous_picks: List[Dict[str, str]] = []
-        all_scores = {q.name: list(q.round_scores) for q in self.players}
-        
+        previous_picks = []
+        all_scores = {p.name: list(p.round_scores) for p in self.players}
+
         for p in self.players:
             ctx = {
                 "phase": "operator_pick",
@@ -147,7 +110,11 @@ class SuitsGambitGame:
                 previous_picks=list(previous_picks),
                 ctx=ctx,
             )
-            op = "+" if op not in ("+", "x") else op
+            # FIX: normalize operators — accept 'x', '×', '*'
+            if op in ("x", "×", "*"):
+                op = "x"
+            else:
+                op = "+"
             p.ops_between.append(op)
             previous_picks.append({"player": p.name, "op": op})
             self._log(f"  -> {p.name}: {op}")
@@ -160,20 +127,19 @@ class SuitsGambitGame:
         for r in range(1, ROUNDS + 1):
             public_state = self._public_state()
             self._log(f"\n=== Round {r} ===")
-            
+
             for p in self.players:
                 score, pre_bust = self._play_single_turn(p, r, public_state)
                 p.round_scores.append(score)
                 p.pre_bust.append(pre_bust)
 
-                if self.stats is not None and RoundOutcome is not None:
+                if self.stats and hasattr(self.stats, "record_round"):
                     op_ctx = p.ops_between[r - 2] if r > 1 and len(p.ops_between) >= (r - 1) else "+"
-                    busted = (score == 0)
-                    outcome = RoundOutcome(
+                    outcome = RoundOutcome(  # type: ignore[name-defined]
                         player=p.name,
                         round_idx=r,
                         points=score,
-                        busted=busted,
+                        busted=(score == 0),
                         pre_bust_streak=pre_bust,
                         op_context=op_ctx
                     )
@@ -182,7 +148,7 @@ class SuitsGambitGame:
             if r < ROUNDS:
                 self._operator_pick_phase(r, public_state)
 
-        results: Dict[str, int] = {p.name: evaluate_expression(p.round_scores, p.ops_between) for p in self.players}
+        results = {p.name: evaluate_expression(p.round_scores, p.ops_between) for p in self.players}
 
         if self.verbose >= 1:
             print("\n=== FINAL ===")

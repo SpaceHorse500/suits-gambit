@@ -1,37 +1,70 @@
-# ga_evaluator.py
-import random, statistics as stats
+# ga/ga_evaluator.py
+import math
+import random
+import statistics as stats
 from typing import Any, Dict, List, Tuple
+
 from .ga_types import Fitness
 from .ga_genome import Genome
 from .ga_controls import ControlPool
 from evo_player import EvoPlayer
 from game import SuitsGambitGame
 
+
+def _quartiles(values: List[int]) -> tuple[float, float]:
+    """Return (Q1, Q3). Robust for small n; falls back to linear percentile."""
+    if not values:
+        return 0.0, 0.0
+    try:
+        # Python 3.8+: inclusive matches spreadsheet-style quartiles well
+        qs = stats.quantiles(values, n=4, method="inclusive")
+        # qs = [Q1, median, Q3]
+        return float(qs[0]), float(qs[2])
+    except Exception:
+        s = sorted(values)
+        n = len(s)
+        if n == 1:
+            return float(s[0]), float(s[0])
+
+        def pctl(p: float) -> float:
+            k = (n - 1) * p
+            f = math.floor(k)
+            c = math.ceil(k)
+            if f == c:
+                return float(s[f])
+            return float(s[f] + (s[c] - s[f]) * (k - f))
+
+        return pctl(0.25), pctl(0.75)
+
+
 class PopulationEvaluator:
     """
-    Fitness = WIN RATE ONLY.
-    We still run normal games, but the returned Fitness objects are scored purely by
-    win_rate. All other numbers are provided only as diagnostics for logging.
+    Fitness = multi-criteria:
+      1) win_rate (primary),
+      2) median score (secondary),
+      3) Q1, then Q3 (tertiary).
+    All other diagnostics are for logging only.
     """
     def __init__(self, controls: ControlPool):
         self.controls = controls
 
-    def evaluate_all_in_one(self,
-                            pop: List[Genome],
-                            games_per_eval: int = 1000,
-                            base_seed: int = 123,
-                            verbose_game: int = 0
-                            ) -> Tuple[List[Fitness], Dict[str, Fitness]]:
+    def evaluate_all_in_one(
+        self,
+        pop: List[Genome],
+        games_per_eval: int = 1000,
+        base_seed: int = 123,
+        verbose_game: int = 0
+    ) -> Tuple[List[Fitness], Dict[str, Fitness]]:
+
         P = len(pop)
         ctrl_players = self.controls.make()
         ctrl_names = [c.name for c in ctrl_players]
 
-        # --- Accumulators (minimized; we only *need* wins) ---
+        # --- Accumulators ---
         wins = [0 for _ in range(P)]
         ctrl_wins: Dict[str, int] = {n: 0 for n in ctrl_names}
 
-        # Kept as diagnostics only (not used for fitness now)
-        totals = [[] for _ in range(P)]
+        totals: List[List[int]] = [[] for _ in range(P)]
         max_score = [0 for _ in range(P)]
         min_score = [None for _ in range(P)]
         bust_rounds = [0 for _ in range(P)]
@@ -60,84 +93,84 @@ class PopulationEvaluator:
 
                 if p.name in name_to_idx:
                     i = name_to_idx[p.name]
-                    # diagnostics only
                     totals[i].append(score)
                     max_score[i] = max(max_score[i], score)
-                    min_val = min_score[i]
-                    min_score[i] = score if min_val is None else min(min_val, score)
+                    mn = min_score[i]
+                    min_score[i] = score if mn is None else min(mn, score)
                     rounds_played[i] += len(p.round_scores)
                     bust_rounds[i] += sum(1 for s in p.round_scores if s == 0)
-
                 elif p.name in ctrl_totals:
                     ctrl_totals[p.name].append(score)
                     ctrl_max[p.name] = max(ctrl_max[p.name], score)
-                    cmin = ctrl_min[p.name]
-                    ctrl_min[p.name] = score if cmin is None else min(cmin, score)
+                    cmn = ctrl_min[p.name]
+                    ctrl_min[p.name] = score if cmn is None else min(cmn, score)
                     ctrl_rounds_played[p.name] += len(p.round_scores)
                     ctrl_bust_rounds[p.name] += sum(1 for s in p.round_scores if s == 0)
 
-            # WIN RATE ONLY: count wins; ties give no credit
+            # WIN RATE only counts outright wins; ties give no credit
             if winner in name_to_idx:
                 wins[name_to_idx[winner]] += 1
             elif winner in ctrl_wins:
                 ctrl_wins[winner] += 1
 
-        # --- Finalize genomes (fitness = win_rate only) ---
+        # --- Finalize genomes ---
         fits: List[Fitness] = []
         for i in range(P):
             wr = wins[i] / max(1, games_per_eval)
 
-            # Everything else is diagnostics only
+            # robust summary stats (used for secondary ranking & diagnostics)
             n = len(totals[i])
-            mean = (sum(totals[i]) / n) if n else 0.0
-            sd = (stats.pstdev(totals[i]) if n > 1 else 0.0)
             med = float(stats.median(totals[i])) if n else 0.0
+            q1, q3 = _quartiles(totals[i]) if n else (0.0, 0.0)
+            mean = (sum(totals[i]) / n) if n else 0.0
+            sd = stats.pstdev(totals[i]) if n > 1 else 0.0
             mx = int(max_score[i]) if n else 0
             mn = int(min_score[i]) if (min_score[i] is not None) else 0
             br = (bust_rounds[i] / rounds_played[i]) if rounds_played[i] else 0.0
+            iqr = q3 - q1
 
             fits.append(Fitness(
-                # Only win_rate matters; set these neutrally if your GA ignores them,
-                # or leave median for logging but DO NOT sort by it.
-                median=0.0,               # neutral placeholder
-                win_rate=wr,              # <<< FITNESS DIMENSION
-                max_score=0,              # neutral
-                min_score=0,              # neutral
+                win_rate=wr,
+                median=med,
+                q1=q1,
+                q3=q3,
+                max_score=mx,
+                min_score=mn,
                 diagnostics={
-                    "median_observed": med,
                     "mean": mean,
                     "sd": sd,
-                    "max": mx,
-                    "min": mn,
+                    "iqr": iqr,
                     "bust_rate": br,
                     "n_games": n,
                 }
             ))
 
-        # --- Finalize controls (win_rate only, rest diagnostics) ---
+        # --- Finalize controls (for logging) ---
         control_fits: Dict[str, Fitness] = {}
-        for n, ts in ctrl_totals.items():
-            wr = ctrl_wins[n] / max(1, games_per_eval)
+        for nme, ts in ctrl_totals.items():
+            wr = ctrl_wins[nme] / max(1, games_per_eval)
             count = len(ts)
-            mean = (sum(ts) / count) if count else 0.0
-            sd = (stats.pstdev(ts) if count > 1 else 0.0)
             med = float(stats.median(ts)) if count else 0.0
-            mx = int(ctrl_max[n]) if count else 0
-            mn = int(ctrl_min[n]) if (ctrl_min[n] is not None) else 0
-            rounds = ctrl_rounds_played[n]
-            br = (ctrl_bust_rounds[n] / rounds) if rounds else 0.0
+            q1, q3 = _quartiles(ts) if count else (0.0, 0.0)
+            mean = (sum(ts) / count) if count else 0.0
+            sd = stats.pstdev(ts) if count > 1 else 0.0
+            mx = int(ctrl_max[nme]) if count else 0
+            mn = int(ctrl_min[nme]) if (ctrl_min[nme] is not None) else 0
+            rounds = ctrl_rounds_played[nme]
+            br = (ctrl_bust_rounds[nme] / rounds) if rounds else 0.0
+            iqr = q3 - q1
 
-            control_fits[n] = Fitness(
-                median=0.0,              # neutral
-                win_rate=wr,             # <<< FITNESS DIMENSION
-                max_score=0,             # neutral
-                min_score=0,             # neutral
+            control_fits[nme] = Fitness(
+                win_rate=wr,
+                median=med,
+                q1=q1,
+                q3=q3,
+                max_score=mx,
+                min_score=mn,
                 diagnostics={
-                    "median_observed": med,
                     "mean": mean,
                     "sd": sd,
-                    "max": mx,
-                    "min": mn,
+                    "iqr": iqr,
                     "bust_rate": br,
                     "n_games": count,
                 }

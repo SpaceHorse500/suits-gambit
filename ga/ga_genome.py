@@ -1,12 +1,19 @@
 # ga_genome.py
-import copy, json
-from typing import Any, Dict, List
+import copy, json, hashlib
+from typing import Any, Dict, List, Optional
 from evo_io import DEFAULT_GENOME
 from .ga_bounds import iter_paths, get_holder, clamp_to_bounds
 
 class Genome:
     def __init__(self, data: Dict[str, Any] | None = None):
         self.data: Dict[str, Any] = copy.deepcopy(data if data is not None else DEFAULT_GENOME)
+        self.parent_ids: Optional[List[str]] = None  # set by GA runner if desired
+
+    # Stable id computed from payload (updates automatically if payload changes)
+    @property
+    def id(self) -> str:
+        s = json.dumps(self.data, sort_keys=True, separators=(",", ":"))
+        return hashlib.blake2s(s.encode("utf-8"), digest_size=8).hexdigest()
 
     @classmethod
     def from_default(cls) -> "Genome":
