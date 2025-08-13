@@ -1,7 +1,7 @@
 # ga/pod_evaluator.py
 from __future__ import annotations
-import math, random, statistics as stats
-from typing import Any, Dict, List, Tuple, Callable, Iterable
+import math, random, statistics as stats, json, copy
+from typing import Any, Dict, List, Tuple, Callable
 
 from evo_player import EvoPlayer
 from game import SuitsGambitGame
@@ -12,18 +12,32 @@ try:
 except Exception:
     from smart_player import SmartPlayer as MetaPlayer  # graceful fallback
 
-# Reuse your Fitness dataclass to avoid breaking code
-try:
-    from .ga_types import Fitness
-except Exception:
-    from dataclasses import dataclass
-    @dataclass
-    class Fitness:
-        median: float
-        win_rate: float
-        max_score: int
-        min_score: int
-        diagnostics: Dict[str, Any]
+# Reuse your Fitness dataclass so the field order matches (needs q1/q3)
+from .ga_types import Fitness
+
+
+# ---------- helpers ----------
+def _quartiles(values: List[int]) -> tuple[float, float]:
+    """Return (Q1, Q3) with robust fallbacks for small n."""
+    if not values:
+        return 0.0, 0.0
+    try:
+        qs = stats.quantiles(values, n=4, method="inclusive")  # [Q1, median, Q3]
+        return float(qs[0]), float(qs[2])
+    except Exception:
+        s = sorted(values)
+        n = len(s)
+        if n == 1:
+            x = float(s[0])
+            return x, x
+        def pctl(p: float) -> float:
+            k = (n - 1) * p
+            f = math.floor(k)
+            c = math.ceil(k)
+            if f == c:
+                return float(s[f])
+            return float(s[f] + (s[c] - s[f]) * (k - f))
+        return pctl(0.25), pctl(0.75)
 
 
 def pairwise_elo_update(
@@ -32,12 +46,7 @@ def pairwise_elo_update(
     ranks: Dict[str, float],
     k_factor: float = 24.0,
 ) -> None:
-    """
-    Multi-player Elo via pairwise comparisons:
-    - If A ranks better than B -> A gets a 'win' vs B (1.0), else 0.0; ties => 0.5
-    - One pass, in-place updates on 'ratings'
-    """
-    # Pre-compute expected scores
+    """Multi-player Elo via pairwise comparisons."""
     expected: Dict[Tuple[str, str], float] = {}
     for i in range(len(names)):
         for j in range(i + 1, len(names)):
@@ -46,12 +55,10 @@ def pairwise_elo_update(
             ea = 1.0 / (1.0 + 10 ** ((rb - ra) / 400.0))
             expected[(a, b)] = ea
 
-    # Accumulate deltas then apply (so order doesn't bias)
     delta: Dict[str, float] = {n: 0.0 for n in names}
     for i in range(len(names)):
         for j in range(i + 1, len(names)):
             a, b = names[i], names[j]
-            # Rank: lower number = better (1st place best)
             if abs(ranks[a] - ranks[b]) < 1e-9:
                 sa = 0.5
             elif ranks[a] < ranks[b]:
@@ -60,19 +67,14 @@ def pairwise_elo_update(
                 sa = 0.0
             ea = expected[(a, b)]
             eb = 1.0 - ea
-
             delta[a] += k_factor * (sa - ea)
             delta[b] += k_factor * ((1.0 - sa) - eb)
-
     for n in names:
         ratings[n] += delta[n]
 
 
 def rank_from_scores(scores: Dict[str, int]) -> Dict[str, float]:
-    """
-    Returns 1-based ranks with ties averaged (competition ranking -> average rank).
-    Higher score is better.
-    """
+    """1-based ranks with ties averaged (higher score is better)."""
     items = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
     ranks: Dict[str, float] = {}
     i = 0
@@ -80,8 +82,6 @@ def rank_from_scores(scores: Dict[str, int]) -> Dict[str, float]:
         j = i
         while j < len(items) and items[j][1] == items[i][1]:
             j += 1
-        # items[i:j] tie block occupies places i..j-1 (0-based)
-        # their rank is the average of 1-based positions
         start_place = i + 1
         end_place = j
         avg_rank = (start_place + end_place) / 2.0
@@ -92,25 +92,32 @@ def rank_from_scores(scores: Dict[str, int]) -> Dict[str, float]:
 
 
 def borda_points(rank: float, pod_size: int) -> float:
-    """
-    Linear rank points in [0,1]: 1st -> 1.0; last -> 0.0.
-    Ties handled by passing averaged rank.
-    """
+    """Linear rank points in [0,1]: 1st -> 1.0; last -> 0.0."""
     return (pod_size - rank) / (pod_size - 1)
 
 
+# Accept dict / JSON string / Genome-like objects
+def _as_genome_dict(obj: Any) -> Dict[str, Any]:
+    if isinstance(obj, dict):
+        return copy.deepcopy(obj)
+    to_json = getattr(obj, "to_json", None)
+    if callable(to_json):
+        payload = to_json()
+        if isinstance(payload, dict):
+            return copy.deepcopy(payload)
+        if isinstance(payload, str):
+            return json.loads(payload)
+    data = getattr(obj, "data", None)
+    if isinstance(data, dict):
+        return copy.deepcopy(data)
+    raise TypeError(f"Genome-like object not convertible to dict: {type(obj)}")
+
+
+# ---------- evaluator ----------
 class PodEloEvaluator:
     """
-    Evaluate genomes in pods of fixed size (default 5):
-      - Each pod = (pod_size - 1) Evo genomes + 1 Meta control
-      - Seat rotation each round
-      - Pairwise Elo updates per game
-      - Returns Fitness list (per genome) + control Fitness
-
-    Notes:
-      * Runtime is dominated by game simulation; Elo math is negligible.
-      * If genomes don't divide evenly into (pod_size-1), the last pod
-        is padded with extra Meta controls (so every game has exactly pod_size players).
+    Evaluate genomes in pods of fixed size (default 5).
+    Each pod = (pod_size - 1) Evo genomes + 1 Meta control.
     """
 
     def __init__(
@@ -122,31 +129,26 @@ class PodEloEvaluator:
     ):
         assert pod_size >= 3, "pod_size must be at least 3"
         self.pod_size = pod_size
-        self.gpp = pod_size - 1  # genomes per pod (1 seat reserved for Meta)
+        self.gpp = pod_size - 1
         self.initial_elo = initial_elo
         self.k = k_factor
         self.control_factory = control_factory or (lambda name: MetaPlayer(name))
 
     def _make_pods(self, indices: List[int], rng: random.Random) -> List[List[int]]:
-        """Chunk genome indices into pods of size self.gpp (4 when pod_size=5)."""
-        pods: List[List[int]] = []
-        for i in range(0, len(indices), self.gpp):
-            pods.append(indices[i : i + self.gpp])
-        return pods
+        return [indices[i : i + self.gpp] for i in range(0, len(indices), self.gpp)]
 
     def evaluate(
         self,
-        pop: List[Any],                  # Genome objects (must have .to_json())
-        rounds: int = 100,              # how many scheduling rounds
+        pop: List[Any],
+        rounds: int = 100,
         base_seed: int = 12345,
-        verbose_game: int = 0,          # pass to SuitsGambitGame
+        verbose_game: int = 0,
     ) -> Tuple[List[Fitness], Dict[str, Fitness]]:
         P = len(pop)
         rng_master = random.Random(base_seed)
 
-        # Ratings and accumulators
         elo: Dict[str, float] = {f"Evo{i}": self.initial_elo for i in range(P)}
-        elo_meta: float = self.initial_elo  # shared Meta rating
+        elo_meta: float = self.initial_elo
 
         totals: List[List[int]] = [[] for _ in range(P)]
         wins = [0 for _ in range(P)]
@@ -158,7 +160,6 @@ class PodEloEvaluator:
         max_score = [0 for _ in range(P)]
         min_score = [None for _ in range(P)]
 
-        # Control accumulators (Meta across all pods)
         meta_totals: List[int] = []
         meta_wins = 0
         meta_bust_rounds = 0
@@ -166,74 +167,55 @@ class PodEloEvaluator:
         meta_max = 0
         meta_min: int | None = None
 
-        # Scheduling
         for r in range(rounds):
-            # Shuffle genome indices; make pods of gpp
             idxs = list(range(P))
             rng_round = random.Random(rng_master.randint(0, 2**31 - 1))
             rng_round.shuffle(idxs)
             pods = self._make_pods(idxs, rng_round)
 
             for p_idx, pod in enumerate(pods):
-                # Build player list for this pod
                 players = []
-                evo_names: List[str] = []
                 for gi in pod:
                     name = f"Evo{gi}"
-                    players.append(EvoPlayer(name, genome=pop[gi].to_json()))
-                    evo_names.append(name)
+                    genome_payload = _as_genome_dict(pop[gi])
+                    players.append(EvoPlayer(name, genome=genome_payload))
 
-                # If pod has fewer than gpp genomes, pad with extra Metas
                 while len(players) < self.gpp:
                     players.append(self.control_factory(f"Meta_pad{p_idx}_{len(players)}"))
 
-                # Always one Meta seat
                 players.append(self.control_factory(f"Meta_{r}_{p_idx}"))
 
-                # Seat rotation: rotate by (r + p_idx) to balance seats across rounds/pods
                 rot = (r + p_idx) % self.pod_size
                 players = players[rot:] + players[:rot]
 
-                # Run the game
                 seed = base_seed ^ (r * 1315423911 + p_idx * 2654435761)
                 game = SuitsGambitGame(players, verbose=verbose_game, seed=seed)
-                winner, results = game.play()  # results: name -> total
+                winner, results = game.play()
 
-                # Compute ranks (+ rank points)
                 ranks = rank_from_scores(results)
                 rpts = {n: borda_points(ranks[n], self.pod_size) for n in ranks}
 
-                # Elo: include Meta as one identity (shared rating)
                 names_this_game = [p.name for p in players]
-                # Temporary ratings view for this game
                 tmp_ratings: Dict[str, float] = {}
                 for n in names_this_game:
-                    if n.startswith("Evo"):
-                        tmp_ratings[n] = elo[n]
-                    else:
-                        tmp_ratings[n] = elo_meta
+                    tmp_ratings[n] = elo[n] if n.startswith("Evo") else elo_meta
 
                 pairwise_elo_update(tmp_ratings, names_this_game, ranks, k_factor=self.k)
 
-                # Write back updated ratings
                 for n in names_this_game:
                     if n.startswith("Evo"):
                         elo[n] = tmp_ratings[n]
                     else:
-                        # Merge all Meta clones into single shared elo
                         elo_meta = tmp_ratings[n]
 
-                # Collect stats
                 name_to_idx = {f"Evo{i}": i for i in range(P)}
-                # Determine first/second place sets for quick win/top2
                 best_score = max(results.values())
-                # ranks: lower is better; 1.0 is 1st
-                second_rank = sorted(set(ranks.values()))[1] if len(set(ranks.values())) > 1 else 1.0
+                uniq_ranks = sorted(set(ranks.values()))
+                second_rank = uniq_ranks[1] if len(uniq_ranks) > 1 else 1.0
 
                 for pl in players:
                     total = results[pl.name]
-                    is_meta = not pl.name.startswith("Evo")
-                    if is_meta:
+                    if not pl.name.startswith("Evo"):
                         meta_totals.append(total)
                         meta_max = max(meta_max, total)
                         meta_min = total if meta_min is None else min(meta_min, total)
@@ -249,7 +231,6 @@ class PodEloEvaluator:
                         ranks_accum[i].append(ranks[pl.name])
                         rank_pts_sum[i] += rpts[pl.name]
 
-                # Wins / Top2
                 winners = [n for n, s in results.items() if s == best_score]
                 seconders = [n for n, rk in ranks.items() if abs(rk - second_rank) < 1e-9]
                 for n in winners:
@@ -261,30 +242,44 @@ class PodEloEvaluator:
                     if n.startswith("Evo"):
                         top2[name_to_idx[n]] += 1
 
-        # Prepare Fitness outputs (per genome)
+        # -- Pack genome Fitness (include q1/q3) --
         fits: List[Fitness] = []
-        baseline_win = 1.0 / self.pod_size  # random baseline in 5-player pod = 0.2
+        baseline_win = 1.0 / self.pod_size
         for i in range(P):
             ts = totals[i]
             if not ts:
-                fits.append(Fitness(0.0, 0.0, 0, 0,
-                    {"elo": self.initial_elo, "mean": 0.0, "sd": 0.0, "bust_rate": 1.0,
-                     "rank_mean": float('inf'), "rank_points": 0.0, "lift_vs_baseline": 0.0, "n_games": 0}))
+                fits.append(Fitness(
+                    win_rate=0.0,
+                    median=0.0,
+                    q1=0.0,
+                    q3=0.0,
+                    max_score=0,
+                    min_score=0,
+                    diagnostics={
+                        "elo": self.initial_elo, "mean": 0.0, "sd": 0.0, "bust_rate": 1.0,
+                        "rank_mean": float('inf'), "rank_points": 0.0,
+                        "lift_vs_baseline": 0.0, "n_games": 0,
+                    }
+                ))
                 continue
 
             med = float(stats.median(ts))
+            q1, q3 = _quartiles(ts)
             mx = int(max_score[i])
             mn = int(min_score[i]) if min_score[i] is not None else 0
             wr = wins[i] / len(ts)
             br = (bust_rounds[i] / rounds_played[i]) if rounds_played[i] else 1.0
             rank_mean = sum(ranks_accum[i]) / len(ranks_accum[i]) if ranks_accum[i] else float('inf')
-            rank_pts_mean = rank_pts_sum[i] / len(ts) if ts else 0.0
+            rank_pts_mean = rank_pts_sum[i] / len(ts)
             mean_total = sum(ts) / len(ts)
             sd_total = stats.pstdev(ts) if len(ts) > 1 else 0.0
             lift = (wr / baseline_win) if baseline_win > 0 else 0.0
+
             fits.append(Fitness(
-                median=med,
                 win_rate=wr,
+                median=med,
+                q1=q1,
+                q3=q3,
                 max_score=mx,
                 min_score=mn,
                 diagnostics={
@@ -300,17 +295,20 @@ class PodEloEvaluator:
                 }
             ))
 
-        # Control Fitness (Meta across all pods)
+        # -- Control Fitness (Meta), also include q1/q3 --
         if meta_totals:
             meta_wr = meta_wins / len(meta_totals)
             meta_med = float(stats.median(meta_totals))
+            meta_q1, meta_q3 = _quartiles(meta_totals)
             meta_mean = sum(meta_totals) / len(meta_totals)
             meta_sd = stats.pstdev(meta_totals) if len(meta_totals) > 1 else 0.0
             meta_br = (meta_bust_rounds / meta_rounds_played) if meta_rounds_played else 1.0
             control_fits = {
                 "Meta": Fitness(
-                    median=meta_med,
                     win_rate=meta_wr,
+                    median=meta_med,
+                    q1=meta_q1,
+                    q3=meta_q3,
                     max_score=int(meta_max),
                     min_score=int(meta_min) if meta_min is not None else 0,
                     diagnostics={
@@ -324,8 +322,17 @@ class PodEloEvaluator:
             }
         else:
             control_fits = {
-                "Meta": Fitness(0.0, 0.0, 0, 0,
-                    {"elo": self.initial_elo, "mean": 0.0, "sd": 0.0, "bust_rate": 1.0, "n_games": 0})
+                "Meta": Fitness(
+                    win_rate=0.0,
+                    median=0.0,
+                    q1=0.0,
+                    q3=0.0,
+                    max_score=0,
+                    min_score=0,
+                    diagnostics={
+                        "elo": self.initial_elo, "mean": 0.0, "sd": 0.0, "bust_rate": 1.0, "n_games": 0
+                    }
+                )
             }
 
         return fits, control_fits

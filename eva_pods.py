@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # eva_pods.py
 from __future__ import annotations
-import argparse, copy, json, math, os, random
+import argparse, copy, json, math, os, random, statistics
 from typing import Any, Dict, List, Tuple
 
-# --- Pod evaluator (from earlier message) ---
+# --- Pod evaluator ---
 from ga.pod_evaluator import PodEloEvaluator
 
 # Try to use your Genome class if it exists, but don't require .random()
@@ -19,8 +19,12 @@ class SimpleGenome:
     def __init__(self, payload: Dict[str, Any]):
         self.payload = payload
 
-    def to_json(self) -> str:
-        return json.dumps(self.payload, separators=(",", ":"))
+    def to_json(self) -> Dict[str, Any]:
+        """
+        IMPORTANT: Return a dict (not a JSON string), so EvoPlayer receives
+        a mapping and can do self.g["forbidden"], etc.
+        """
+        return copy.deepcopy(self.payload)
 
 
 def _load_baseline(path: str = "weights.json") -> Dict[str, Any]:
